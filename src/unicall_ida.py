@@ -577,16 +577,32 @@ def _stack_region_debug(cfunc, var_idx, lo_ea=None, hi_ea=None):
     return (blob if len(blob) >= 8 else None), diag
 
 
+def _is_call_insn_robust(ea, insn):
+    """Call detection that survives cross-version API differences."""
+    for mod_name in ("ida_ua", "ida_idp"):
+        try:
+            fn = getattr(sys.modules.get(mod_name), "is_call_insn", None)
+            if fn is not None and fn(insn):
+                return True
+        except Exception:
+            pass
+    try:
+        import ida_bytes
+        return ida_bytes.get_byte(ea) == 0xE8     # direct call rel32
+    except Exception:
+        return False
+
+
 def _machine_stack_blob(insn_ea, want_len):
     """Reconstruct the stack region feeding a call from machine-level
     immediate stores (mov [rsp+X], imm). This is immune to how Hex-Rays
     renders the buffer (scalar spills, indexed arrays, qmemcpy tails):
     at the machine level every form is an immediate store.
 
-    Stores are scoped to the statement window between the previous call
-    instruction and this one. Returns (blob, diag)."""
+    Stores are constrained to addresses at or before the call instruction,
+    and further to the window between the previous call and this one when
+    a previous call exists. Returns (blob, diag)."""
     import ida_funcs
-    import ida_idp
     import ida_ua
     import idautils
     diag = {"windowed": False, "stores": 0, "runs": []}
@@ -599,7 +615,7 @@ def _machine_stack_blob(insn_ea, want_len):
         insn = ida_ua.insn_t()
         if ida_ua.decode_insn(insn, ea) <= 0:
             continue
-        if ida_idp.is_call_insn(insn):
+        if _is_call_insn_robust(ea, insn):
             calls.append(ea)
             continue
         op0, op1 = insn.ops[0], insn.ops[1]
@@ -608,11 +624,15 @@ def _machine_stack_blob(insn_ea, want_len):
                 and op1.type == ida_ua.o_imm and op0.size in (1, 2, 4, 8):
             stores.append((ea, op0.addr, op0.size, op1.value))
 
+    if insn_ea is None or insn_ea == _BADADDR:
+        return None, diag
     prev = max((c for c in calls if c < insn_ea), default=None)
     windowed = prev is not None
     diag["windowed"] = windowed
     slots = {}
     for ea, disp, size, val in stores:
+        if ea > insn_ea:
+            continue
         if windowed and not (prev < ea <= insn_ea):
             continue
         try:
@@ -644,6 +664,11 @@ def _machine_stack_blob(insn_ea, want_len):
         exact = [b for _, b in runs if len(b) == want_len]
         if exact:
             return exact[0], diag
+        # a wide store (e.g. a dword for a 3-byte qmemcpy tail) can push a
+        # run one element past want_len; trimming the prefix is safe here
+        prefix = [b for _, b in runs if len(b) > want_len]
+        if prefix:
+            return prefix[0][:want_len], diag
     return max(runs, key=lambda rb: len(rb[1]))[1], diag
 
 
