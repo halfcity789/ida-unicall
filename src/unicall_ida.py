@@ -62,6 +62,7 @@ HOTKEY_EMULATE = "Ctrl-Alt-E"
 HOTKEY_MANUAL = "Ctrl-Alt-U"
 
 _current_vu = [None]
+_ACTIVE_DIALOGS = []          # keep dialog references alive (prevent GC)
 
 
 # ===========================================================================
@@ -188,28 +189,51 @@ def _collect(cfunc):
 def find_call(vdui):
     """Locate the call expression under the cursor (the call itself, the
     callee name, or -- when unambiguous -- anywhere in the view)."""
-    item = vdui.ctree_item
-    if item is None or not item.is_citem():
-        return None
-    e = item.e
-    if e is None:
-        return None
-    e = _unwrap_cast(e)
-    if e.op == cot_call:
-        return e
-
     calls, _ = _collect(vdui.cfunc)
-    if e.op == cot_obj:
-        direct = [c for c in calls
-                  if _unwrap_cast(c.x).op == cot_obj and c.x.obj_ea == e.obj_ea]
-        if len(direct) == 1:
-            return direct[0]
-        if len(direct) > 1:
-            if e.ea != _BADADDR:
-                for c in direct:
-                    if c.ea == e.ea:
-                        return c
-            return direct[0]
+    if not calls:
+        return None
+
+    # ctree item under the cursor; the attribute name differs across IDA
+    # versions (ct in the SDK, ctree_item in some older bindings)
+    item = None
+    for attr in ("ct", "ctree_item"):
+        item = getattr(vdui, attr, None)
+        if item is not None:
+            break
+
+    if item is not None:
+        try:
+            if item.is_citem():
+                e = item.e
+                if e is not None:
+                    e = _unwrap_cast(e)
+                    if e.op == cot_call:
+                        return e
+                    if e.op == cot_obj:
+                        direct = [c for c in calls if
+                                  _unwrap_cast(c.x).op == cot_obj
+                                  and c.x.obj_ea == e.obj_ea]
+                        if len(direct) == 1:
+                            return direct[0]
+                        if len(direct) > 1 and e.ea != _BADADDR:
+                            for c in direct:
+                                if c.ea == e.ea:
+                                    return c
+                        if direct:
+                            return direct[0]
+        except Exception:
+            pass
+
+    # fallback: cursor address equals a call expression address
+    try:
+        ea = ida_kernwin.get_screen_ea()
+        by_ea = [c for c in calls if c.ea == ea]
+        if len(by_ea) == 1:
+            return by_ea[0]
+    except Exception:
+        pass
+
+    # last resort: a single call in the whole view is unambiguous
     if len(calls) == 1:
         return calls[0]
     return None
@@ -554,16 +578,38 @@ def _dialog_class():
 def show_dialog(sample_path, base, info=None, vdui=None, manual_ea=None):
     """Open the dialog. `info` is CallInfo (approach A) or None (approach B:
     manual mode with blank fields)."""
+    QtCore, QtWidgets = _qt()
     ParamDialog = _dialog_class()
+
+    parent = None
+    try:
+        parent = QtWidgets.QApplication.activeWindow()
+    except Exception:
+        pass
+
     if info is not None:
         call_ea = info.ea if info.ea and info.ea != _BADADDR \
             else (info.callee_ea or 0)
-        dialog = ParamDialog(sample_path, base, call_ea, info.args)
+        dialog = ParamDialog(sample_path, base, call_ea, info.args,
+                             parent=parent)
         dialog.vdui = vdui
     else:
         blanks = [ArgInfo("unknown", None) for _ in range(6)]
-        dialog = ParamDialog(sample_path, base, manual_ea or 0, blanks)
+        dialog = ParamDialog(sample_path, base, manual_ea or 0, blanks,
+                             parent=parent)
+
+    # a parentless dialog with no Python reference would be garbage
+    # collected immediately; keep it alive until it is closed
+    _ACTIVE_DIALOGS.append(dialog)
+
+    def _cleanup(*_a):
+        if dialog in _ACTIVE_DIALOGS:
+            _ACTIVE_DIALOGS.remove(dialog)
+
+    dialog.finished.connect(_cleanup)
     dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
     return dialog
 
 
