@@ -372,10 +372,12 @@ def _stack_var_bytes(cfunc, var_idx):
         if rhs.op != cot_num:
             continue
         try:
-            val = int(rhs.numval()) & (2**64 - 1)
+            # negative char values arrive sign-extended to 64 bits; mask to
+            # the element width or to_bytes overflows
+            val = int(rhs.numval()) & ((1 << (esize * 8)) - 1)
+            slots[idx] = val.to_bytes(esize, "little")
         except Exception:
             continue
-        slots[idx] = val.to_bytes(esize, "little")
 
     if not slots:
         return None
@@ -592,7 +594,9 @@ def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
         blob = _stack_var_bytes(cfunc, e.v.idx)
         if blob is not None:
             return ArgInfo("stack-bytes", blob,
-                           note=" (from immediate stores)")
+                           note=" (from indexed stores)")
+        return ArgInfo("unknown", None,
+                       note=" (indexed var: stores not contiguous)")
     return ArgInfo("unknown", None)
 
 
