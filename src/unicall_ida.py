@@ -50,8 +50,8 @@ except ImportError:                                    # outside IDA
 
 if _IDA_OK:
     from ida_hexrays import (
-        cot_add, cot_asg, cot_call, cot_cast, cot_idx, cot_num, cot_obj,
-        cot_ptr, cot_ref, cot_str, cot_var,
+        cot_add, cot_asg, cot_call, cot_cast, cot_helper, cot_idx, cot_num,
+        cot_obj, cot_ptr, cot_ref, cot_str, cot_var,
     )
     _BADADDR = ida_idaapi.BADADDR
 else:
@@ -163,8 +163,16 @@ def _elem_size(lvar):
 
 
 def _collect(cfunc):
-    """Walk the ctree once; return (all call exprs, all assignment pairs)."""
-    calls, assignments = [], []
+    """Walk the ctree once; return (call exprs, assignment pairs, copy fills).
+
+    calls:       list of cot_call cexprs
+    assignments: list of (ea, lhs, rhs) for `x = <numeric>` statements
+    copy_fills:  list of (ea, dst_var_idx, dst_off, bytes) for helper copies
+                 of the form qmemcpy(&var, "literal", n) / memset(&var, c, n)
+                 -- Hex-Rays emits these for byte arrays initialized from
+                 string literals
+    """
+    calls, assignments, copy_fills = [], [], []
 
     class V(ida_hexrays.ctree_visitor_t):
         def __init__(self):
@@ -174,8 +182,11 @@ def _collect(cfunc):
             try:
                 if e.op == cot_call:
                     calls.append(e)
+                    fill = _parse_copy_fill(e)
+                    if fill is not None:
+                        copy_fills.append((e.ea,) + fill)
                 elif e.op == cot_asg:
-                    assignments.append((e.x, e.y))
+                    assignments.append((e.ea, e.x, e.y))
             except Exception:
                 pass
             return 0
@@ -184,7 +195,56 @@ def _collect(cfunc):
         V().apply_to(cfunc.body, None)
     except Exception:
         pass
-    return calls, assignments
+    return calls, assignments, copy_fills
+
+
+def _parse_copy_fill(call_expr):
+    """Return (dst_var_idx, dst_off, data) for a qmemcpy/memset-style helper
+    call filling a stack variable, else None."""
+    try:
+        callee = _unwrap_cast(call_expr.x)
+        name = ""
+        if callee.op == cot_helper:
+            name = (callee.helper or "").lower()
+        elif callee.op == cot_obj:
+            import ida_name
+            name = (ida_name.get_name(callee.obj_ea) or "").lower()
+        if not any(k in name for k in ("qmemcpy", "memcpy", "memset")):
+            return None
+        args = list(call_expr.a)
+        if len(args) < 2:
+            return None
+        dst = _unwrap_cast(args[0])
+        if dst.op == cot_ref:
+            dst = _unwrap_cast(dst.x)
+        if dst.op != cot_var:
+            return None
+        src = _unwrap_cast(args[1])
+        if src.op == cot_str:
+            try:
+                data = src.string
+                if isinstance(data, str):
+                    data = data.encode("utf-8", errors="replace")
+                data = bytes(data)
+            except Exception:
+                return None
+        elif src.op == cot_num:
+            val = int(src.numval()) & (2**64 - 1)
+            size = 8
+            if len(args) > 2 and _unwrap_cast(args[2]).op == cot_num:
+                size = max(1, min(8, int(_unwrap_cast(args[2]).numval())))
+            data = val.to_bytes(size, "little")
+        else:
+            return None
+        if len(args) > 2 and _unwrap_cast(args[2]).op == cot_num and \
+                src.op == cot_str:
+            n = int(_unwrap_cast(args[2]).numval())
+            if 0 < n <= len(data):
+                data = data[:n]
+        # the destination lvar is resolved against lvars by the caller
+        return (dst.v.idx, data)
+    except Exception:
+        return None
 
 
 def find_call(vdui):
@@ -297,7 +357,7 @@ def _stkoff(lvar):
     return None
 
 
-def _stack_region_bytes(cfunc, var_idx):
+def _stack_region_bytes(cfunc, var_idx, lo_ea=None, hi_ea=None):
     """Assemble a stack region from immediate assignments to scalar stack
     variables.
 
@@ -305,7 +365,12 @@ def _stack_region_bytes(cfunc, var_idx):
     into individually named one-byte variables next to a qword holder:
         src_ = 0xC2...53LL; v7 = -33; n37 = 37; ...
     Slots are placed by frame offset relative to the referenced variable;
-    the result is the contiguous run starting at that variable."""
+    the result is the contiguous run starting at that variable.
+
+    lo_ea/hi_ea restrict the collected statements to the (lo, hi] address
+    window -- the code feeding one call site. Branches that reuse the same
+    scalar variables for a different call write at disjoint addresses, so
+    the window keeps the sites from contaminating each other."""
     lvars = cfunc.get_lvars()
     try:
         base = lvars[var_idx]
@@ -315,9 +380,21 @@ def _stack_region_bytes(cfunc, var_idx):
     if base_off is None:
         return None
 
-    _, assignments = _collect(cfunc)
+    windowed = lo_ea is not None and hi_ea is not None \
+        and hi_ea != _BADADDR
+
+    def in_window(stmt_ea):
+        if not windowed:
+            return True
+        if stmt_ea is None or stmt_ea == _BADADDR:
+            return False       # unpositioned stmt in a windowed fn: unsafe
+        return lo_ea < stmt_ea <= hi_ea
+
+    _, assignments, copy_fills = _collect(cfunc)
     slots = {}
-    for lhs, rhs in assignments:
+    for ea, lhs, rhs in assignments:
+        if not in_window(ea):
+            continue
         lhs = _unwrap_cast(lhs)
         if lhs.op != cot_var or rhs.op != cot_num:
             continue
@@ -340,6 +417,18 @@ def _stack_region_bytes(cfunc, var_idx):
             continue
         slots[off] = val.to_bytes(size, "little")
 
+    for ea, dst_idx, data in copy_fills:
+        if not in_window(ea):
+            continue
+        try:
+            v = lvars[dst_idx]
+        except Exception:
+            continue
+        off = _stkoff(v)
+        if off is None or off < base_off:
+            continue
+        slots[off] = data
+
     if base_off not in slots:
         return None
     chunks, off = [], base_off
@@ -350,7 +439,7 @@ def _stack_region_bytes(cfunc, var_idx):
     return blob if len(blob) >= 8 else None
 
 
-def _classify(cfunc, arg, lvars):
+def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
     e = _unwrap_cast(arg)
     op = e.op
     if op == cot_num:
@@ -358,7 +447,7 @@ def _classify(cfunc, arg, lvars):
     if op == cot_ref and e.x.op == cot_obj:
         return ArgInfo("address", int(e.x.obj_ea))
     if op == cot_ref and e.x.op == cot_var and lvars is not None:
-        blob = _stack_region_bytes(cfunc, e.x.v.idx)
+        blob = _stack_region_bytes(cfunc, e.x.v.idx, lo_ea, hi_ea)
         if blob is not None:
             return ArgInfo("stack-bytes", blob,
                            note=" (from immediate stores)")
@@ -394,10 +483,27 @@ def extract(vdui):
         lvars = vdui.cfunc.get_lvars()
     except Exception:
         lvars = None
+
+    # statement window for stack-region extraction: assignments belonging
+    # to this call site lie between the previous call expression and this
+    # one. Branches reusing the same scalar variables write at disjoint
+    # addresses, so the window keeps parallel sites from mixing.
+    lo_ea = hi_ea = None
+    try:
+        calls, _, _ = _collect(vdui.cfunc)
+        eas = sorted(c.ea for c in calls
+                     if c.ea is not None and c.ea != _BADADDR)
+        if call.ea is not None and call.ea != _BADADDR:
+            hi_ea = call.ea
+            prev = [ea for ea in eas if ea < hi_ea]
+            lo_ea = prev[-1] if prev else None
+    except Exception:
+        lo_ea = hi_ea = None
+
     args = []
     for arg in call.a:
         try:
-            args.append(_classify(vdui.cfunc, arg, lvars))
+            args.append(_classify(vdui.cfunc, arg, lvars, lo_ea, hi_ea))
         except Exception:
             args.append(ArgInfo("unknown", None))
 
