@@ -198,49 +198,87 @@ def _collect(cfunc):
     return calls, assignments, copy_fills
 
 
+def _string_literal_bytes(e):
+    """Best-effort byte extraction from a cot_str expression. The attribute
+    holding the text differs across IDA versions, so try the known names
+    and fall back to parsing the rendered form."""
+    for attr in ("string", "str"):
+        try:
+            v = getattr(e, attr)
+            if v is None:
+                continue
+            if isinstance(v, str):
+                return v.encode("utf-8", errors="replace")
+            if isinstance(v, (bytes, bytearray)):
+                return bytes(v)
+        except Exception:
+            pass
+    try:
+        rendered = str(e)
+        if len(rendered) >= 2 and rendered[0] == '"' and rendered[-1] == '"':
+            return rendered[1:-1].encode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return None
+
+
 def _parse_copy_fill(call_expr):
-    """Return (dst_var_idx, dst_off, data) for a qmemcpy/memset-style helper
-    call filling a stack variable, else None."""
+    """Return (dst_var_idx, data) for a qmemcpy/memset-style helper call
+    filling a stack variable, else None."""
     try:
         callee = _unwrap_cast(call_expr.x)
         name = ""
         if callee.op == cot_helper:
-            name = (callee.helper or "").lower()
+            name = str(getattr(callee, "helper", "") or "").lower()
         elif callee.op == cot_obj:
             import ida_name
             name = (ida_name.get_name(callee.obj_ea) or "").lower()
+        if not name:                       # last resort: rendered form
+            try:
+                name = str(callee).lower()
+            except Exception:
+                return None
         if not any(k in name for k in ("qmemcpy", "memcpy", "memset")):
             return None
         args = list(call_expr.a)
         if len(args) < 2:
             return None
+
+        # destination: accept var, &var, &var[0] and pointer-decay forms
         dst = _unwrap_cast(args[0])
         if dst.op == cot_ref:
             dst = _unwrap_cast(dst.x)
+        if dst.op == cot_ptr and dst.x is not None:
+            dst = _unwrap_cast(dst.x)
+        if dst.op == cot_idx and dst.y is not None:
+            y = _unwrap_cast(dst.y)
+            if y.op == cot_num and int(y.numval()) == 0:
+                dst = _unwrap_cast(dst.x)
         if dst.op != cot_var:
             return None
+
+        # source: string literal or immediate
         src = _unwrap_cast(args[1])
         if src.op == cot_str:
-            try:
-                data = src.string
-                if isinstance(data, str):
-                    data = data.encode("utf-8", errors="replace")
-                data = bytes(data)
-            except Exception:
+            data = _string_literal_bytes(src)
+            if data is None:
                 return None
+            if len(args) > 2:
+                n = _unwrap_cast(args[2])
+                if n.op == cot_num:
+                    cnt = int(n.numval())
+                    if 0 < cnt <= len(data):
+                        data = data[:cnt]
         elif src.op == cot_num:
             val = int(src.numval()) & (2**64 - 1)
             size = 8
-            if len(args) > 2 and _unwrap_cast(args[2]).op == cot_num:
-                size = max(1, min(8, int(_unwrap_cast(args[2]).numval())))
+            if len(args) > 2:
+                n = _unwrap_cast(args[2])
+                if n.op == cot_num:
+                    size = max(1, min(64, int(n.numval())))
             data = val.to_bytes(size, "little")
         else:
             return None
-        if len(args) > 2 and _unwrap_cast(args[2]).op == cot_num and \
-                src.op == cot_str:
-            n = int(_unwrap_cast(args[2]).numval())
-            if 0 < n <= len(data):
-                data = data[:n]
         # the destination lvar is resolved against lvars by the caller
         return (dst.v.idx, data)
     except Exception:
