@@ -287,6 +287,69 @@ def _stack_var_bytes(cfunc, var_idx):
     return b"".join(slots[i] for i in range(n + 1))
 
 
+def _stkoff(lvar):
+    """Frame offset of a stack variable, or None (registers etc.)."""
+    try:
+        if lvar.is_stk_var():
+            return lvar.location.stkoff()
+    except Exception:
+        pass
+    return None
+
+
+def _stack_region_bytes(cfunc, var_idx):
+    """Assemble a stack region from immediate assignments to scalar stack
+    variables.
+
+    This is the shape Hex-Rays produces when a local byte array is spilled
+    into individually named one-byte variables next to a qword holder:
+        src_ = 0xC2...53LL; v7 = -33; n37 = 37; ...
+    Slots are placed by frame offset relative to the referenced variable;
+    the result is the contiguous run starting at that variable."""
+    lvars = cfunc.get_lvars()
+    try:
+        base = lvars[var_idx]
+    except Exception:
+        return None
+    base_off = _stkoff(base)
+    if base_off is None:
+        return None
+
+    _, assignments = _collect(cfunc)
+    slots = {}
+    for lhs, rhs in assignments:
+        lhs = _unwrap_cast(lhs)
+        if lhs.op != cot_var or rhs.op != cot_num:
+            continue
+        try:
+            v = lvars[lhs.v.idx]
+        except Exception:
+            continue
+        off = _stkoff(v)
+        if off is None or off < base_off:
+            continue
+        try:
+            size = v.type().get_size()
+        except Exception:
+            size = 0
+        if not size or size <= 0 or size > 64:
+            continue
+        try:
+            val = int(rhs.numval()) & ((1 << (size * 8)) - 1)
+        except Exception:
+            continue
+        slots[off] = val.to_bytes(size, "little")
+
+    if base_off not in slots:
+        return None
+    chunks, off = [], base_off
+    while off in slots:
+        chunks.append(slots[off])
+        off += len(slots[off])
+    blob = b"".join(chunks)
+    return blob if len(blob) >= 8 else None
+
+
 def _classify(cfunc, arg, lvars):
     e = _unwrap_cast(arg)
     op = e.op
@@ -294,6 +357,11 @@ def _classify(cfunc, arg, lvars):
         return ArgInfo("literal", int(e.numval()) & (2**64 - 1))
     if op == cot_ref and e.x.op == cot_obj:
         return ArgInfo("address", int(e.x.obj_ea))
+    if op == cot_ref and e.x.op == cot_var and lvars is not None:
+        blob = _stack_region_bytes(cfunc, e.x.v.idx)
+        if blob is not None:
+            return ArgInfo("stack-bytes", blob,
+                           note=" (from immediate stores)")
     if op == cot_obj:
         s = _string_at(e.obj_ea)
         if s:
@@ -332,6 +400,15 @@ def extract(vdui):
             args.append(_classify(vdui.cfunc, arg, lvars))
         except Exception:
             args.append(ArgInfo("unknown", None))
+
+    # cross-check a stack blob against the literal length argument: a
+    # partially recovered blob would decrypt into garbage silently
+    if args and args[0].kind == "stack-bytes" and args[0].value is not None \
+            and len(args) > 1 and args[1].kind == "literal" \
+            and isinstance(args[1].value, int) \
+            and len(args[0].value) != args[1].value:
+        args[0] = ArgInfo("unknown", None,
+                          note=" (length mismatch, fill manually)")
     return CallInfo(call.ea, callee, args)
 
 
