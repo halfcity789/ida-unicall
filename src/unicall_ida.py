@@ -24,6 +24,7 @@ Installation: copy this single file into the IDA plugins directory. The
 IDA imports are guarded so that the argument-codec helpers remain testable
 outside IDA; Qt bindings are imported lazily when the dialog opens.
 """
+import os
 import re
 import traceback
 
@@ -616,13 +617,66 @@ def show_dialog(sample_path, base, info=None, vdui=None, manual_ea=None):
 # ===========================================================================
 # IDA plugin integration
 # ===========================================================================
+_UNICALL_NETNODE = "$ unicall_ida"
+
+
+def _resolve_sample_path():
+    """Resolve the sample binary to map into the emulator.
+
+    get_input_file_path() returns the path recorded in the database, which
+    may be stale (the IDB may have been created on another machine).
+    Resolution order: valid IDB path -> previously chosen path (persisted
+    in the database via a netnode) -> file dialog. A valid choice made in
+    the dialog is stored back into the database."""
+    candidates = []
+    try:
+        candidates.append(ida_nalt.get_input_file_path())
+    except Exception:
+        pass
+    try:
+        import ida_netnode
+        cached = ida_netnode.netnode(_UNICALL_NETNODE).supstr(0)
+        if cached:
+            candidates.append(cached)
+    except Exception:
+        pass
+
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+
+    import ida_kernwin
+    default = ""
+    for cand in candidates:
+        if cand:
+            default = os.path.basename(cand)
+            break
+    chosen = ida_kernwin.ask_file(
+        True, default,
+        "unicall: select the sample binary to map into the emulator")
+    if chosen and os.path.exists(chosen):
+        try:
+            import ida_netnode
+            ida_netnode.netnode(_UNICALL_NETNODE).supset(0, chosen)
+        except Exception:
+            pass
+        return chosen
+    return None
+
+
 def _context():
-    """(sample_path, image_base) of the current database."""
-    return ida_nalt.get_input_file_path(), ida_nalt.get_imagebase()
+    """(sample_path, image_base); sample_path is None when unresolvable."""
+    return _resolve_sample_path(), ida_nalt.get_imagebase()
 
 
 def _open_from_vu(vu, manual=False):
     sample, base = _context()
+    if not sample:
+        ida_kernwin.warning(
+            "unicall: the sample binary could not be located.\n"
+            "The path recorded in this database does not exist on this "
+            "machine and no file was selected.")
+        return
     if not manual and vu is not None:
         try:
             info = extract(vu)
