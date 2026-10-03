@@ -66,6 +66,7 @@ HOTKEY_BATCH = "Ctrl-Alt-B"
 
 _current_vu = [None]
 _ACTIVE_DIALOGS = []          # keep dialog references alive (prevent GC)
+_ACTIVE_THREADS = []          # keep running QThreads alive (prevent GC)
 
 
 # ===========================================================================
@@ -688,26 +689,18 @@ def _find_call_insn(expr_ea, callee_ea):
         return expr_ea
 
 
-def _write_result_comments(cfunc, expr_ea, insn_ea, text):
-    """Write a result comment at both levels: the pseudocode line (Hex-Rays
-    user comment attached to the call expression) and the call instruction
-    (standard disassembly comment)."""
+def _write_result_comments(insn_ea, text):
+    """Comment the resolved call instruction. Hex-Rays shows the
+    disassembly comment of the statement's call instruction on the
+    pseudocode line as well, so one write covers both views. user_cmts
+    manipulation is deliberately avoided: a type mismatch in that SWIG
+    map segfaults IDA instead of raising."""
     cmt = 'unicall: "%s"' % text.replace("\n", "\\n")[:400]
     try:
         ida_bytes.set_cmt(insn_ea, cmt, 0)
+        return True
     except Exception:
-        pass
-    try:
-        tl = ida_hexrays.treeloc_t()
-        tl.ea = expr_ea
-        tl.itp = ida_hexrays.ITP_SEMI
-        try:
-            cfunc.user_cmts[tl] = cmt
-        except TypeError:
-            cfunc.user_cmts[tl] = ida_hexrays.citem_cmt_t(cmt)
-        cfunc.save_user_cmts()
-    except Exception:
-        pass
+        return False
 
 
 # ===========================================================================
@@ -916,6 +909,10 @@ def _dialog_class():
                     ret_mode, parent=self)
                 self.thread.done.connect(self.on_done)
                 self.thread.fail.connect(self.on_fail)
+                _ACTIVE_THREADS.append(self.thread)   # keep alive while running
+                self.thread.finished.connect(
+                    lambda: (_ACTIVE_THREADS.remove(self.thread)
+                             if self.thread in _ACTIVE_THREADS else None))
                 self.thread.start()
             except Exception as ex:
                 self.status.setText(f"Error: {ex}")
@@ -947,13 +944,12 @@ def _dialog_class():
                 if not self.comment_ea:
                     raise ValueError("no call-site address recorded")
                 insn_ea = _find_call_insn(self.comment_ea, self.callee_ea)
-                _write_result_comments(self.cfunc, self.comment_ea,
-                                       insn_ea, text)
+                _write_result_comments(insn_ea, text)
                 if self.vdui is not None:
                     self.vdui.refresh_view(True)
                 self.status.setText(
-                    f"Comment written at {self.comment_ea:#x} "
-                    f"(pseudocode) and {insn_ea:#x} (disassembly).")
+                    f"Comment written at {insn_ea:#x} (call instruction; "
+                    f"visible in pseudocode and disassembly).")
             except Exception as ex:
                 self.status.setText(f"Comment failed: {ex}")
 
@@ -1182,20 +1178,12 @@ def _run_batch(vu, target_ea):
                 print(f'[unicall] batch: site {r["insn_ea"]:#x}: '
                       f'{r["text"]}')
                 continue
-            try:
-                cfunc = None
-                try:
-                    import ida_hexrays
-                    cfunc = ida_hexrays.decompile(r["func_ea"])
-                except Exception:
-                    pass
-                _write_result_comments(cfunc, r["expr_ea"], r["insn_ea"],
-                                       r["text"])
+            if _write_result_comments(r["insn_ea"], r["text"]):
                 print(f'[unicall] batch: site {r["insn_ea"]:#x} -> '
                       f'"{r["text"]}"')
-            except Exception as ex:
+            else:
                 print(f'[unicall] batch: comment failed at '
-                      f'{r["insn_ea"]:#x}: {ex}')
+                      f'{r["insn_ea"]:#x}')
         if vu is not None:
             try:
                 vu.refresh_view(True)
@@ -1207,10 +1195,20 @@ def _run_batch(vu, target_ea):
             None, "unicall batch",
             f"{ok} / {len(results)} call sites decrypted and commented.\n"
             f"See the Output window for details.")
+        # release the thread reference now that it is finished
+        if th in _ACTIVE_THREADS:
+            _ACTIVE_THREADS.remove(th)
+
+    def on_fail(text):
+        if th in _ACTIVE_THREADS:
+            _ACTIVE_THREADS.remove(th)
+        ida_kernwin.warning(f"unicall batch failed: {text}")
 
     th.done.connect(on_done)
-    th.fail.connect(lambda text: (
-        ida_kernwin.warning(f"unicall batch failed: {text}")))
+    th.fail.connect(on_fail)
+    # hold a reference for the lifetime of the thread; a garbage-collected
+    # running QThread takes IDA down with it
+    _ACTIVE_THREADS.append(th)
     th.start()
     print(f"[unicall] batch: emulating {len(tasks)} call sites of "
           f"{target_ea:#x}...")
