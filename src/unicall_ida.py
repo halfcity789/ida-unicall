@@ -26,6 +26,7 @@ outside IDA; Qt bindings are imported lazily when the dialog opens.
 """
 import os
 import re
+import sys
 import traceback
 
 # ---------------------------------------------------------------------------
