@@ -58,9 +58,11 @@ else:
     _BADADDR = 0xFFFFFFFFFFFFFFFF
 
 ACTION_ID = "unicall:emulate_call"
+ACTION_ID_BATCH = "unicall:batch_decrypt"
 MENU_PATH = "unicall/"
 HOTKEY_EMULATE = "Ctrl-Alt-E"
 HOTKEY_MANUAL = "Ctrl-Alt-U"
+HOTKEY_BATCH = "Ctrl-Alt-B"
 
 _current_vu = [None]
 _ACTIVE_DIALOGS = []          # keep dialog references alive (prevent GC)
@@ -600,17 +602,15 @@ def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
     return ArgInfo("unknown", None)
 
 
-def extract(vdui):
-    """Top-level helper: vdui -> CallInfo (or None when no call is found)."""
-    call = find_call(vdui)
-    if call is None:
-        return None
+def extract_call(cfunc, call):
+    """Extract argument info for one call expression of a cfunc.
+    Shared by the interactive path (extract) and batch mode."""
     try:
         callee = call.x.obj_ea if _unwrap_cast(call.x).op == cot_obj else None
     except Exception:
         callee = None
     try:
-        lvars = vdui.cfunc.get_lvars()
+        lvars = cfunc.get_lvars()
     except Exception:
         lvars = None
 
@@ -620,7 +620,7 @@ def extract(vdui):
     # addresses, so the window keeps parallel sites from mixing.
     lo_ea = hi_ea = None
     try:
-        calls, _, _ = _collect(vdui.cfunc)
+        calls, _, _ = _collect(cfunc)
         eas = sorted(c.ea for c in calls
                      if c.ea is not None and c.ea != _BADADDR)
         if call.ea is not None and call.ea != _BADADDR:
@@ -633,7 +633,7 @@ def extract(vdui):
     args = []
     for arg in call.a:
         try:
-            args.append(_classify(vdui.cfunc, arg, lvars, lo_ea, hi_ea))
+            args.append(_classify(cfunc, arg, lvars, lo_ea, hi_ea))
         except Exception:
             args.append(ArgInfo("unknown", None))
 
@@ -646,6 +646,68 @@ def extract(vdui):
         args[0] = ArgInfo("unknown", None,
                           note=" (length mismatch, fill manually)")
     return CallInfo(call.ea, callee, args)
+
+
+def extract(vdui):
+    """Top-level helper: vdui -> CallInfo (or None when no call is found)."""
+    call = find_call(vdui)
+    if call is None:
+        return None
+    return extract_call(vdui.cfunc, call)
+
+
+def _find_call_insn(expr_ea, callee_ea):
+    """Locate the call instruction belonging to a call expression. The
+    ctree expression address can trail the instruction (argument setup);
+    scan back a short window for a direct call to the callee."""
+    try:
+        import ida_ua
+        import ida_idp
+        if callee_ea is None or expr_ea is None or expr_ea == _BADADDR:
+            return expr_ea
+        for back in range(0, 24):
+            ea = expr_ea - back
+            if ea < 0x400000:                      # below any image base
+                break
+            insn = ida_ua.insn_t()
+            length = ida_ua.decode_insn(insn, ea)
+            if length <= 0:
+                continue
+            if ida_idp.is_call_insn(insn):
+                # direct relative call: target = next insn + rel
+                import ida_bytes
+                if insn.size == 5 and ida_bytes.get_byte(insn.ea) == 0xE8:
+                    rel = int.from_bytes(
+                        ida_bytes.get_bytes(insn.ea + 1, 4), "little",
+                        signed=True)
+                    if insn.ea + 5 + rel == callee_ea:
+                        return insn.ea
+                return expr_ea                     # some other call: stop
+        return expr_ea
+    except Exception:
+        return expr_ea
+
+
+def _write_result_comments(cfunc, expr_ea, insn_ea, text):
+    """Write a result comment at both levels: the pseudocode line (Hex-Rays
+    user comment attached to the call expression) and the call instruction
+    (standard disassembly comment)."""
+    cmt = 'unicall: "%s"' % text.replace("\n", "\\n")[:400]
+    try:
+        ida_bytes.set_cmt(insn_ea, cmt, 0)
+    except Exception:
+        pass
+    try:
+        tl = ida_hexrays.treeloc_t()
+        tl.ea = expr_ea
+        tl.itp = ida_hexrays.ITP_SEMI
+        try:
+            cfunc.user_cmts[tl] = cmt
+        except TypeError:
+            cfunc.user_cmts[tl] = ida_hexrays.citem_cmt_t(cmt)
+        cfunc.save_user_cmts()
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -740,10 +802,12 @@ def _dialog_class():
             self.sample_path = sample_path
             self.base = base
             # emulate_ea: the function to call (callee); comment_ea: the
-            # call-site instruction the result comment belongs to. The two
-            # are independent on purpose.
+            # call expression address (pseudocode line). The two are
+            # independent on purpose.
             self.emulate_ea = emulate_ea
             self.comment_ea = comment_ea or emulate_ea
+            self.callee_ea = emulate_ea
+            self.cfunc = None
             self.vdui = None
             self.thread = None
             self.last_result = None
@@ -882,12 +946,14 @@ def _dialog_class():
             try:
                 if not self.comment_ea:
                     raise ValueError("no call-site address recorded")
-                comment = 'unicall: "%s"' % text.replace("\n", "\\n")[:400]
-                ida_bytes.set_cmt(self.comment_ea, comment, 0)
+                insn_ea = _find_call_insn(self.comment_ea, self.callee_ea)
+                _write_result_comments(self.cfunc, self.comment_ea,
+                                       insn_ea, text)
                 if self.vdui is not None:
                     self.vdui.refresh_view(True)
                 self.status.setText(
-                    f"Comment written at {self.comment_ea:#x} (call site).")
+                    f"Comment written at {self.comment_ea:#x} "
+                    f"(pseudocode) and {insn_ea:#x} (disassembly).")
             except Exception as ex:
                 self.status.setText(f"Comment failed: {ex}")
 
@@ -915,6 +981,8 @@ def show_dialog(sample_path, base, info=None, vdui=None, manual_ea=None):
         dialog = ParamDialog(sample_path, base, emulate_ea, comment_ea,
                              info.args, parent=parent)
         dialog.vdui = vdui
+        if vdui is not None:
+            dialog.cfunc = vdui.cfunc
     else:
         blanks = [ArgInfo("unknown", None) for _ in range(6)]
         dialog = ParamDialog(sample_path, base, manual_ea or 0, manual_ea or 0,
@@ -933,6 +1001,218 @@ def show_dialog(sample_path, base, info=None, vdui=None, manual_ea=None):
     dialog.raise_()
     dialog.activateWindow()
     return dialog
+
+
+# ===========================================================================
+# batch mode: emulate every call site of one function and comment results
+# ===========================================================================
+def _collect_batch_tasks(target_ea):
+    """Main-thread phase of batch mode: find every call site of target_ea
+    via xrefs, decompile each containing function once, extract arguments
+    from the ctree. Returns a list of task dicts (pure data, safe to hand
+    to a worker thread)."""
+    import ida_funcs
+    import idautils
+    import ida_hexrays
+
+    sites = [x.frm for x in idautils.CodeRefsTo(target_ea, 1)]
+    tasks, errors = [], []
+    func_eas = []
+    for frm in sites:
+        f = ida_funcs.get_func(frm)
+        if f is None:
+            errors.append((frm, "no containing function"))
+            continue
+        if f.start_ea not in func_eas:
+            func_eas.append(f.start_ea)
+
+    for fea in func_eas:
+        try:
+            cfunc = ida_hexrays.decompile(fea)
+        except Exception as ex:
+            errors.append((fea, f"decompile failed: {ex}"))
+            continue
+        calls, _, _ = _collect(cfunc)
+        targets = [c for c in calls
+                   if _unwrap_cast(c.x).op == cot_obj
+                   and c.x.obj_ea == target_ea]
+        if not targets:
+            continue
+        # associate each call expression with its xref'd instruction
+        func_sites = sorted(frm for frm in sites
+                            if ida_funcs.get_func(frm) is not None
+                            and ida_funcs.get_func(frm).start_ea == fea)
+        for call in targets:
+            insn_ea = None
+            for frm in func_sites:
+                if call.ea is not None and call.ea != _BADADDR \
+                        and frm <= call.ea <= frm + 0x20:
+                    insn_ea = frm
+                    break
+            if insn_ea is None:
+                insn_ea = _find_call_insn(call.ea, target_ea)
+            info = extract_call(cfunc, call)
+            values = []
+            unresolved = 0
+            for a in info.args:
+                if a.value is None:
+                    unresolved += 1
+                values.append(a.value)
+            tasks.append(dict(func_ea=fea, expr_ea=info.ea, insn_ea=insn_ea,
+                              values=values, unresolved=unresolved))
+    return tasks, errors
+
+
+def _batch_thread_class():
+    QtCore, _ = _qt()
+    if "BatchThread" in _QT_CACHE:
+        return _QT_CACHE["BatchThread"]
+
+    class BatchThread(QtCore.QThread):
+        """Emulates a list of prepared tasks sequentially, silently."""
+
+        done = QtCore.Signal(list)        # list of result dicts
+        fail = QtCore.Signal(str)
+
+        def __init__(self, sample_path, base, tasks, parent=None):
+            super().__init__(parent)
+            self.sample_path = sample_path
+            self.base = base
+            self.tasks = tasks
+
+        def run(self):
+            results = []
+            try:
+                emu = _get_emu(self.sample_path, self.base)
+                for t in self.tasks:
+                    r = dict(t)
+                    if t["unresolved"]:
+                        r["ok"] = False
+                        r["text"] = f"unresolved args ({t['unresolved']})"
+                        results.append(r)
+                        continue
+                    try:
+                        out = emu.call(t["emulate_ea"], t["values"],
+                                       ret="str")
+                        r["ok"] = True
+                        r["text"] = out
+                    except Exception as ex:
+                        r["ok"] = False
+                        r["text"] = f"{type(ex).__name__}: {ex}"
+                    results.append(r)
+                self.done.emit(results)
+            except Exception as ex:
+                self.fail.emit(f"{type(ex).__name__}: {ex}\n\n"
+                               f"{traceback.format_exc()}")
+
+    _QT_CACHE["BatchThread"] = BatchThread
+    return BatchThread
+
+
+def _batch_emulate_ea(task):
+    """The emulation target of a batch task is the callee being xref'd;
+    stored by the caller in the task dict."""
+    return task["emulate_ea"]
+
+
+def _find_batch_target(vu):
+    """Batch target selection: the callee of the call under the cursor, or
+    the function name under the cursor."""
+    if vu is None:
+        return None
+    item = None
+    for attr in ("ct", "ctree_item"):
+        item = getattr(vu, attr, None)
+        if item is not None:
+            break
+    if item is not None:
+        try:
+            if item.is_citem():
+                e = _unwrap_cast(item.e)
+                if e.op == cot_obj:
+                    return e.obj_ea
+                if e.op == cot_call and _unwrap_cast(e.x).op == cot_obj:
+                    return e.x.obj_ea
+        except Exception:
+            pass
+    info = None
+    try:
+        info = extract(vu)
+    except Exception:
+        pass
+    if info is not None and info.callee_ea:
+        return info.callee_ea
+    return None
+
+
+def _run_batch(vu, target_ea):
+    """Entry point for batch mode. All ctree work happens here on the main
+    thread; only Unicorn execution moves to the worker."""
+    sample, base = _context()
+    if not sample:
+        ida_kernwin.warning(
+            "unicall: the sample binary could not be located.\n"
+            "The path recorded in this database does not exist on this "
+            "machine and no file was selected.")
+        return
+    try:
+        tasks, errors = _collect_batch_tasks(target_ea)
+    except Exception as ex:
+        ida_kernwin.warning(f"unicall: batch collection failed: {ex}")
+        return
+    for ea, why in errors:
+        print(f"[unicall] batch: {ea:#x}: {why}")
+    if not tasks:
+        ida_kernwin.warning(
+            f"unicall: no decompilable call sites of {target_ea:#x} found.")
+        return
+
+    for t in tasks:
+        t["emulate_ea"] = target_ea
+
+    QtCore, QtWidgets = _qt()
+    BatchThread = _batch_thread_class()
+    th = BatchThread(sample, base, tasks)
+
+    def on_done(results):
+        ok = sum(1 for r in results if r["ok"])
+        for r in results:
+            if not r["ok"]:
+                print(f'[unicall] batch: site {r["insn_ea"]:#x}: '
+                      f'{r["text"]}')
+                continue
+            try:
+                cfunc = None
+                try:
+                    import ida_hexrays
+                    cfunc = ida_hexrays.decompile(r["func_ea"])
+                except Exception:
+                    pass
+                _write_result_comments(cfunc, r["expr_ea"], r["insn_ea"],
+                                       r["text"])
+                print(f'[unicall] batch: site {r["insn_ea"]:#x} -> '
+                      f'"{r["text"]}"')
+            except Exception as ex:
+                print(f'[unicall] batch: comment failed at '
+                      f'{r["insn_ea"]:#x}: {ex}')
+        if vu is not None:
+            try:
+                vu.refresh_view(True)
+            except Exception:
+                pass
+        print(f"[unicall] batch finished: {ok}/{len(results)} decrypted "
+              f"and commented")
+        QtWidgets.QMessageBox.information(
+            None, "unicall batch",
+            f"{ok} / {len(results)} call sites decrypted and commented.\n"
+            f"See the Output window for details.")
+
+    th.done.connect(on_done)
+    th.fail.connect(lambda text: (
+        ida_kernwin.warning(f"unicall batch failed: {text}")))
+    th.start()
+    print(f"[unicall] batch: emulating {len(tasks)} call sites of "
+          f"{target_ea:#x}...")
 
 
 # ===========================================================================
@@ -1027,11 +1307,32 @@ if _IDA_OK:
         def update(self, ctx):
             return ida_kernwin.AST_ENABLE_ALWAYS
 
+    class _BatchActionHandler(ida_kernwin.action_handler_t):
+        def activate(self, ctx):
+            vu = _current_vu[0]
+            if vu is None and HAS_HEXRAYS:
+                widget = ida_kernwin.get_current_widget()
+                if widget is not None:
+                    vu = ida_hexrays.get_widget_vdui(widget)
+            target = _find_batch_target(vu)
+            if target is None:
+                ida_kernwin.warning(
+                    "unicall: place the cursor on a call to the target "
+                    "function or on its name, then run batch again.")
+                return 1
+            _run_batch(vu, target)
+            return 1
+
+        def update(self, ctx):
+            return ida_kernwin.AST_ENABLE_ALWAYS
+
     def _hexrays_callback(event, *args):
         if event == ida_hexrays.hxe_populating_popup:
             form, popup, vu = args[0], args[1], args[2]
             _current_vu[0] = vu
             ida_kernwin.attach_action_to_popup(form, popup, ACTION_ID,
+                                               MENU_PATH)
+            ida_kernwin.attach_action_to_popup(form, popup, ACTION_ID_BATCH,
                                                MENU_PATH)
         return 0
 
@@ -1051,6 +1352,12 @@ if _IDA_OK:
                 _EmulateActionHandler(), HOTKEY_EMULATE,
                 "Emulate the call under the cursor with unicall", -1)
             ida_kernwin.register_action(desc)
+            desc_b = ida_kernwin.action_desc_t(
+                ACTION_ID_BATCH, "unicall: batch decrypt all call sites",
+                _BatchActionHandler(), HOTKEY_BATCH,
+                "Emulate every call site of the function under the cursor "
+                "and comment all successful results", -1)
+            ida_kernwin.register_action(desc_b)
             if HAS_HEXRAYS:
                 ida_hexrays.install_hexrays_callback(_hexrays_callback)
                 print("[unicall_ida] loaded (pseudocode integration "
@@ -1065,6 +1372,7 @@ if _IDA_OK:
 
         def term(self):
             ida_kernwin.unregister_action(ACTION_ID)
+            ida_kernwin.unregister_action(ACTION_ID_BATCH)
 
     def PLUGIN_ENTRY():
         return unicall_plugin_t()
