@@ -51,9 +51,7 @@ str_decrypted = str_decrypt(src: str_cipher, n: 48, 35, &dword_61F2F0, n32: (cha
 1. 将 unicall 安装进 IDA 使用的 Python 解释器：
 
    ```bash
-   <ida-python> -m pip install -e <workspace>/unicall
-   # 或
-   <ida-python> -m pip install <workspace>/unicall/dist/unicall-0.1.0-py3-none-any.whl
+   <ida-python> -m pip install unicall-emu
    ```
 
 2. 将 `src/unicall_ida.py` 单个文件复制到 IDA 插件目录：

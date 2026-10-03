@@ -479,10 +479,10 @@ def _emulate_thread_class():
             except Exception as ex:
                 text = f"{type(ex).__name__}: {ex}\n\n{traceback.format_exc()}"
                 if isinstance(ex, ImportError):
-                    text += ("\n\nHint: the unicall package must be "
+                    text += ("\n\nHint: the unicall-emu package must be "
                              "installed into the Python interpreter used "
                              "by IDA, e.g.\n    <ida-python> -m pip install"
-                             " -e <path-to-unicall>")
+                             " unicall-emu")
                 self.fail.emit(text)
 
     _QT_CACHE["EmulateThread"] = EmulateThread

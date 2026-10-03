@@ -6,15 +6,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "halfcity" }]
-dependencies = ["unicall"]
+dependencies = ["unicall-emu>=0.1.0"]
 
 [tool.uv]
 # The plugin is loaded by IDA as a plain package directory, not installed
 # as a wheel; pyproject exists to manage the development environment.
 package = false
-
-[tool.uv.sources]
-unicall = { path = "../unicall" }
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
