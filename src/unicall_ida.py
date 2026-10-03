@@ -419,14 +419,18 @@ def _dialog_class():
         return _QT_CACHE["ParamDialog"]
 
     class ParamDialog(QtWidgets.QDialog):
-        def __init__(self, sample_path, base, call_ea, arg_infos=None,
-                     parent=None):
+        def __init__(self, sample_path, base, emulate_ea, comment_ea=None,
+                     arg_infos=None, parent=None):
             super().__init__(parent)
             self.setWindowTitle("unicall - emulate call")
             self.resize(760, 480)
             self.sample_path = sample_path
             self.base = base
-            self.call_ea = call_ea
+            # emulate_ea: the function to call (callee); comment_ea: the
+            # call-site instruction the result comment belongs to. The two
+            # are independent on purpose.
+            self.emulate_ea = emulate_ea
+            self.comment_ea = comment_ea or emulate_ea
             self.vdui = None
             self.thread = None
             self.last_result = None
@@ -434,9 +438,12 @@ def _dialog_class():
             lay = QtWidgets.QVBoxLayout(self)
 
             top = QtWidgets.QGridLayout()
-            top.addWidget(QtWidgets.QLabel("call address"), 0, 0)
+            top.addWidget(QtWidgets.QLabel("emulate function"), 0, 0)
             self.ea_edit = QtWidgets.QLineEdit(
-                hex(call_ea) if call_ea else "")
+                hex(emulate_ea) if emulate_ea else "")
+            self.ea_edit.setToolTip(
+                "Address of the function to emulate (the callee), not the "
+                "call site")
             top.addWidget(self.ea_edit, 0, 1)
             top.addWidget(QtWidgets.QLabel("convention"), 0, 2)
             self.conv_combo = QtWidgets.QComboBox()
@@ -560,15 +567,14 @@ def _dialog_class():
                 self.status.setText("Nothing to comment yet - run first.")
                 return
             try:
-                ea_text = self.ea_edit.text().strip()
-                if not ea_text:
-                    raise ValueError("call address is empty")
-                ea = int(ea_text, 0)
+                if not self.comment_ea:
+                    raise ValueError("no call-site address recorded")
                 comment = 'unicall: "%s"' % text.replace("\n", "\\n")[:400]
-                ida_bytes.set_cmt(ea, comment, 0)
+                ida_bytes.set_cmt(self.comment_ea, comment, 0)
                 if self.vdui is not None:
                     self.vdui.refresh_view(True)
-                self.status.setText("Comment written.")
+                self.status.setText(
+                    f"Comment written at {self.comment_ea:#x} (call site).")
             except Exception as ex:
                 self.status.setText(f"Comment failed: {ex}")
 
@@ -589,15 +595,17 @@ def show_dialog(sample_path, base, info=None, vdui=None, manual_ea=None):
         pass
 
     if info is not None:
-        call_ea = info.ea if info.ea and info.ea != _BADADDR \
-            else (info.callee_ea or 0)
-        dialog = ParamDialog(sample_path, base, call_ea, info.args,
-                             parent=parent)
+        # emulate the callee function; comment belongs to the call site
+        emulate_ea = info.callee_ea or (
+            info.ea if info.ea and info.ea != _BADADDR else 0)
+        comment_ea = info.ea if info.ea and info.ea != _BADADDR else emulate_ea
+        dialog = ParamDialog(sample_path, base, emulate_ea, comment_ea,
+                             info.args, parent=parent)
         dialog.vdui = vdui
     else:
         blanks = [ArgInfo("unknown", None) for _ in range(6)]
-        dialog = ParamDialog(sample_path, base, manual_ea or 0, blanks,
-                             parent=parent)
+        dialog = ParamDialog(sample_path, base, manual_ea or 0, manual_ea or 0,
+                             blanks, parent=parent)
 
     # a parentless dialog with no Python reference would be garbage
     # collected immediately; keep it alive until it is closed
