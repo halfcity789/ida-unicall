@@ -250,7 +250,7 @@ def _parse_copy_fill(call_expr):
 def find_call(vdui):
     """Locate the call expression under the cursor (the call itself, the
     callee name, or -- when unambiguous -- anywhere in the view)."""
-    calls, _ = _collect(vdui.cfunc)
+    calls, _, _ = _collect(vdui.cfunc)
     if not calls:
         return None
 
@@ -324,9 +324,9 @@ def _stack_var_bytes(cfunc, var_idx):
         return None
     esize = _elem_size(lvar)
 
-    _, assignments = _collect(cfunc)
+    _, assignments, _ = _collect(cfunc)
     slots = {}
-    for lhs, rhs in assignments:
+    for _ea, lhs, rhs in assignments:
         idx = _index_of_var(lhs, var_idx)
         if idx is None:
             continue
