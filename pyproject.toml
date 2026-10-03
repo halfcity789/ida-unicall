@@ -1,6 +1,6 @@
 [project]
 name = "ida-unicall"
-version = "0.1.0"
+version = "0.2.0"
 description = "IDA plugin: right-click a pseudocode call and emulate it in place with unicall"
 readme = "README.md"
 requires-python = ">=3.10"
