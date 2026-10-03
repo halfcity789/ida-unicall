@@ -260,7 +260,7 @@ def _parse_copy_fill(call_expr):
         if dst.op != cot_var:
             return None
 
-        # source: string literal or immediate
+        # source: string literal, image object (rodata blob), or immediate
         src = _unwrap_cast(args[1])
         if src.op == cot_str:
             data = _string_literal_bytes(src)
@@ -272,6 +272,20 @@ def _parse_copy_fill(call_expr):
                     cnt = int(n.numval())
                     if 0 < cnt <= len(data):
                         data = data[:cnt]
+        elif src.op == cot_obj:
+            # qmemcpy(dst, &unk_41XXXX, n): the ciphertext lives in the
+            # image (rodata); read it via IDA
+            count = 0
+            if len(args) > 2:
+                n = _unwrap_cast(args[2])
+                if n.op == cot_num:
+                    count = int(n.numval())
+            if not 0 < count <= 0x8000:
+                return None
+            import ida_bytes
+            data = ida_bytes.get_bytes(src.obj_ea, count)
+            if not data:
+                return None
         elif src.op == cot_num:
             val = int(src.numval()) & (2**64 - 1)
             size = 8
@@ -563,6 +577,26 @@ def _stack_region_debug(cfunc, var_idx, lo_ea=None, hi_ea=None):
     return (blob if len(blob) >= 8 else None), diag
 
 
+def _classify_stack_blob(cfunc, var_idx, lo_ea, hi_ea):
+    """Assemble a stack buffer for a local variable, trying both shapes:
+    scalar spills next to a qword holder and indexed array stores. The
+    analyst may convert between the two forms in IDA; extraction must not
+    depend on which one Hex-Rays currently renders."""
+    blob, diag = _stack_region_debug(cfunc, var_idx, lo_ea, hi_ea)
+    if blob is not None:
+        return ArgInfo("stack-bytes", blob, note=" (from immediate stores)")
+    blob = _stack_var_bytes(cfunc, var_idx)
+    if blob is not None:
+        return ArgInfo("stack-bytes", blob, note=" (from indexed stores)")
+    return ArgInfo(
+        "unknown", None,
+        note=" (var off={:#x}, window={}, asg slots={}, fills={}, run={}B, "
+             "indexed stores not contiguous)".format(
+                 diag["base_off"] if diag["base_off"] is not None else -1,
+                 diag["windowed"], diag["n_asg"], diag["n_fill"],
+                 diag["run"]))
+
+
 def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
     e = _unwrap_cast(arg)
     op = e.op
@@ -571,17 +605,7 @@ def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
     if op == cot_ref and e.x.op == cot_obj:
         return ArgInfo("address", int(e.x.obj_ea))
     if op == cot_ref and e.x.op == cot_var and lvars is not None:
-        blob, diag = _stack_region_debug(cfunc, e.x.v.idx, lo_ea, hi_ea)
-        if blob is not None:
-            return ArgInfo("stack-bytes", blob,
-                           note=" (from immediate stores)")
-        return ArgInfo(
-            "unknown", None,
-            note=" (ref var off={:#x}, window={}, asg slots={}, fills={}, "
-                 "run={}B)".format(
-                     diag["base_off"] if diag["base_off"] is not None else -1,
-                     diag["windowed"], diag["n_asg"], diag["n_fill"],
-                     diag["run"]))
+        return _classify_stack_blob(cfunc, e.x.v.idx, lo_ea, hi_ea)
     if op == cot_obj:
         s = _string_at(e.obj_ea)
         if s:
@@ -594,12 +618,7 @@ def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
         except Exception:
             pass
     if op == cot_var and lvars is not None:
-        blob = _stack_var_bytes(cfunc, e.v.idx)
-        if blob is not None:
-            return ArgInfo("stack-bytes", blob,
-                           note=" (from indexed stores)")
-        return ArgInfo("unknown", None,
-                       note=" (indexed var: stores not contiguous)")
+        return _classify_stack_blob(cfunc, e.v.idx, lo_ea, hi_ea)
     return ArgInfo("unknown", None)
 
 
@@ -646,6 +665,23 @@ def extract_call(cfunc, call):
             and len(args[0].value) != args[1].value:
         args[0] = ArgInfo("unknown", None,
                           note=" (length mismatch, fill manually)")
+
+    # the 4th argument is the key pointer. When it is the VALUE of a global
+    # variable living in zero-initialized memory (.bss), the key is
+    # generated at runtime; decrypting with the zeroed address as key
+    # material would silently produce garbage.
+    if len(args) > 3 and args[3].kind == "address" \
+            and isinstance(args[3].value, int):
+        try:
+            import ida_bytes
+            raw = ida_bytes.get_bytes(args[3].value, 8)
+            if raw == b"\x00" * 8:
+                args[3] = ArgInfo(
+                    "unknown", None,
+                    note=" (runtime-generated key pointer, "
+                         "not statically resolvable)")
+        except Exception:
+            pass
     return CallInfo(call.ea, callee, args)
 
 
