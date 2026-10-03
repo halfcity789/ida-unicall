@@ -1,0 +1,23 @@
+[project]
+name = "ida-unicall"
+version = "0.1.0"
+description = "IDA plugin: right-click a pseudocode call and emulate it in place with unicall"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "halfcity" }]
+dependencies = ["unicall"]
+
+[tool.uv]
+# The plugin is loaded by IDA as a plain package directory, not installed
+# as a wheel; pyproject exists to manage the development environment.
+package = false
+
+[tool.uv.sources]
+unicall = { path = "../unicall" }
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
