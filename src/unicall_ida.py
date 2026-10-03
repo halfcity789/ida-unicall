@@ -577,6 +577,76 @@ def _stack_region_debug(cfunc, var_idx, lo_ea=None, hi_ea=None):
     return (blob if len(blob) >= 8 else None), diag
 
 
+def _machine_stack_blob(insn_ea, want_len):
+    """Reconstruct the stack region feeding a call from machine-level
+    immediate stores (mov [rsp+X], imm). This is immune to how Hex-Rays
+    renders the buffer (scalar spills, indexed arrays, qmemcpy tails):
+    at the machine level every form is an immediate store.
+
+    Stores are scoped to the statement window between the previous call
+    instruction and this one. Returns (blob, diag)."""
+    import ida_funcs
+    import ida_idp
+    import ida_ua
+    import idautils
+    diag = {"windowed": False, "stores": 0, "runs": []}
+    f = ida_funcs.get_func(insn_ea)
+    if f is None:
+        return None, diag
+
+    calls, stores = [], []
+    for ea in idautils.FuncItems(f.start_ea):
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) <= 0:
+            continue
+        if ida_idp.is_call_insn(insn):
+            calls.append(ea)
+            continue
+        op0, op1 = insn.ops[0], insn.ops[1]
+        # mov [rsp+disp], imm  (reg 4 = rsp in IDA's x86 numbering)
+        if op0.type == ida_ua.o_displ and op0.reg == 4 \
+                and op1.type == ida_ua.o_imm and op0.size in (1, 2, 4, 8):
+            stores.append((ea, op0.addr, op0.size, op1.value))
+
+    prev = max((c for c in calls if c < insn_ea), default=None)
+    windowed = prev is not None
+    diag["windowed"] = windowed
+    slots = {}
+    for ea, disp, size, val in stores:
+        if windowed and not (prev < ea <= insn_ea):
+            continue
+        try:
+            slots[disp] = val.to_bytes(size, "little")
+        except Exception:
+            continue
+    diag["stores"] = len(slots)
+    if not slots:
+        return None, diag
+
+    # enumerate contiguous runs and prefer the one matching want_len
+    runs, seen = [], set()
+    for start in sorted(slots):
+        if start in seen:
+            continue
+        chunks, off = [], start
+        while off in slots:
+            seen.add(off)
+            chunks.append(slots[off])
+            off += len(slots[off])
+        blob = b"".join(chunks)
+        if len(blob) >= 8:
+            runs.append((start, blob))
+    diag["runs"] = [len(b) for _, b in runs]
+    if not runs:
+        return None, diag
+
+    if want_len:
+        exact = [b for _, b in runs if len(b) == want_len]
+        if exact:
+            return exact[0], diag
+    return max(runs, key=lambda rb: len(rb[1]))[1], diag
+
+
 def _classify_stack_blob(cfunc, var_idx, lo_ea, hi_ea):
     """Assemble a stack buffer for a local variable, trying both shapes:
     scalar spills next to a qword holder and indexed array stores. The
@@ -656,6 +726,20 @@ def extract_call(cfunc, call):
             args.append(_classify(cfunc, arg, lvars, lo_ea, hi_ea))
         except Exception:
             args.append(ArgInfo("unknown", None))
+
+    # machine-level fallback: if the ciphertext argument (arg 0) could not
+    # be recovered from the ctree, rebuild it from immediate stack stores
+    # in the function. This covers every rendering form Hex-Rays may choose.
+    if args and args[0].value is None and len(args) > 1 \
+            and args[1].kind == "literal" and isinstance(args[1].value, int):
+        try:
+            insn_ea0 = _find_call_insn(call.ea, callee)
+            blob, mdiag = _machine_stack_blob(insn_ea0, args[1].value)
+        except Exception:
+            blob = None
+        if blob is not None:
+            args[0] = ArgInfo("stack-bytes", blob,
+                              note=" (from machine-level stack stores)")
 
     # cross-check a stack blob against the literal length argument: a
     # partially recovered blob would decrypt into garbage silently
