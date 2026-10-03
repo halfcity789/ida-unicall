@@ -477,6 +477,87 @@ def _stack_region_bytes(cfunc, var_idx, lo_ea=None, hi_ea=None):
     return blob if len(blob) >= 8 else None
 
 
+def _stack_region_debug(cfunc, var_idx, lo_ea=None, hi_ea=None):
+    """_stack_region_bytes with diagnostics. Returns (blob, diag) where
+    diag explains what was collected -- shown in the dialog when the
+    region could not be assembled, so failures are inspectable."""
+    lvars = cfunc.get_lvars()
+    diag = {"base_off": None, "windowed": False, "n_asg": 0, "n_fill": 0,
+            "slots": 0, "run": 0}
+    try:
+        base = lvars[var_idx]
+    except Exception:
+        return None, diag
+    base_off = _stkoff(base)
+    diag["base_off"] = base_off
+    if base_off is None:
+        return None, diag
+    windowed = lo_ea is not None and hi_ea is not None \
+        and hi_ea != _BADADDR
+    diag["windowed"] = windowed
+
+    def in_window(stmt_ea):
+        if not windowed:
+            return True
+        if stmt_ea is None or stmt_ea == _BADADDR:
+            return False
+        return lo_ea < stmt_ea <= hi_ea
+
+    _, assignments, copy_fills = _collect(cfunc)
+    slots = {}
+    for ea, lhs, rhs in assignments:
+        if not in_window(ea):
+            continue
+        lhs = _unwrap_cast(lhs)
+        if lhs.op != cot_var or rhs.op != cot_num:
+            continue
+        try:
+            v = lvars[lhs.v.idx]
+        except Exception:
+            continue
+        off = _stkoff(v)
+        if off is None or off < base_off:
+            continue
+        try:
+            size = v.type().get_size()
+        except Exception:
+            size = 0
+        if not size or size <= 0 or size > 64:
+            continue
+        try:
+            val = int(rhs.numval()) & ((1 << (size * 8)) - 1)
+        except Exception:
+            continue
+        slots[off] = val.to_bytes(size, "little")
+
+    fills_skipped = 0
+    for ea, dst_idx, data in copy_fills:
+        if not in_window(ea):
+            continue
+        try:
+            v = lvars[dst_idx]
+        except Exception:
+            fills_skipped += 1
+            continue
+        off = _stkoff(v)
+        if off is None or off < base_off:
+            fills_skipped += 1
+            continue
+        slots[off] = data
+    diag["n_asg"] = len(slots)
+    diag["n_fill"] = len(copy_fills) - fills_skipped
+
+    if base_off not in slots:
+        return None, diag
+    chunks, off = [], base_off
+    while off in slots:
+        chunks.append(slots[off])
+        off += len(slots[off])
+    blob = b"".join(chunks)
+    diag["run"] = len(blob)
+    return (blob if len(blob) >= 8 else None), diag
+
+
 def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
     e = _unwrap_cast(arg)
     op = e.op
@@ -485,10 +566,17 @@ def _classify(cfunc, arg, lvars, lo_ea=None, hi_ea=None):
     if op == cot_ref and e.x.op == cot_obj:
         return ArgInfo("address", int(e.x.obj_ea))
     if op == cot_ref and e.x.op == cot_var and lvars is not None:
-        blob = _stack_region_bytes(cfunc, e.x.v.idx, lo_ea, hi_ea)
+        blob, diag = _stack_region_debug(cfunc, e.x.v.idx, lo_ea, hi_ea)
         if blob is not None:
             return ArgInfo("stack-bytes", blob,
                            note=" (from immediate stores)")
+        return ArgInfo(
+            "unknown", None,
+            note=" (ref var off={:#x}, window={}, asg slots={}, fills={}, "
+                 "run={}B)".format(
+                     diag["base_off"] if diag["base_off"] is not None else -1,
+                     diag["windowed"], diag["n_asg"], diag["n_fill"],
+                     diag["run"]))
     if op == cot_obj:
         s = _string_at(e.obj_ea)
         if s:
