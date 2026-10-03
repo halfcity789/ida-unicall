@@ -1015,7 +1015,8 @@ def _collect_batch_tasks(target_ea):
     import idautils
     import ida_hexrays
 
-    sites = [x.frm for x in idautils.CodeRefsTo(target_ea, 1)]
+    # CodeRefsTo yields call-site addresses (ints), not xref objects
+    sites = list(idautils.CodeRefsTo(target_ea, 1))
     tasks, errors = [], []
     func_eas = []
     for frm in sites:
