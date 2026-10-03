@@ -56,10 +56,10 @@ str_decrypted = str_decrypt(src: str_cipher, n: 48, 35, &dword_61F2F0, n32: (cha
    <ida-python> -m pip install <workspace>/unicall/dist/unicall-0.1.0-py3-none-any.whl
    ```
 
-2. 将 `src/unicall_ida/` 整个目录复制（或建联接）到 IDA 插件目录：
+2. 将 `src/unicall_ida.py` 单个文件复制到 IDA 插件目录：
 
-   ```text
-   %APPDATA%\Hex-Rays\IDA Pro\plugins\unicall_ida\
+   ```bash
+   cp src/unicall_ida.py "<IDA>/plugins/unicall_ida.py"
    ```
 
 3. 重启 IDA，Output 窗口出现 `[unicall_ida] loaded` 即安装成功。
@@ -70,7 +70,7 @@ str_decrypted = str_decrypt(src: str_cipher, n: 48, 35, &dword_61F2F0, n32: (cha
 
 ```bash
 uv sync            # 解析依赖（unicall 走本地路径源）
-uv run pytest -q   # argcodec 纯逻辑测试（无需 IDA，6 项）
+uv run pytest -q   # argcodec 纯逻辑测试（无需 IDA，7 项）
 ```
 
 IDA 相关代码（extractor / dialog / worker / 插件入口）依赖 IDA 运行环境，需在 IDA 内验证；仓库内测试只覆盖无 IDA 依赖的纯逻辑部分。

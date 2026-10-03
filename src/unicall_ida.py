@@ -1,25 +1,655 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""unicall_ida_plugin.py -- IDA plugin entry (thin loader).
-
-IDA does not execute a plugin package's __init__.py as a plugin; it scans
-plain .py files inside plugin directories instead. This file is the entry
-IDA discovers: it ensures the package directory's parent is importable and
-delegates everything to the unicall_ida package.
 """
-import os
-import sys
+unicall_ida -- IDA plugin (single file): emulate a pseudocode call in place
+with the unicall package.
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _path in (_PARENT, _HERE):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+Two ways to use the plugin:
 
+  Approach A (pseudocode integration): right-click a call in the Hex-Rays
+  pseudocode view and choose "unicall: emulate this call". Arguments are
+  recovered from the ctree (numeric literals, image addresses, string
+  literals, stack arrays filled with immediates) and pre-filled into the
+  parameter dialog; anything unrecognized stays blank.
+
+  Approach B (manual): Edit > Plugins > unicall (or Ctrl-Alt-U) opens the
+  same dialog with blank fields and the screen address as the call target.
+
+In both cases the dialog is always shown; emulation only starts after an
+explicit "Run".
+
+Installation: copy this single file into the IDA plugins directory. The
+`unicall` package must be installed into the Python interpreter IDA uses.
+
+IDA imports are guarded so that the argument-codec helpers remain testable
+outside IDA; Qt bindings are imported lazily when the dialog opens.
+"""
+import re
+import traceback
+
+# ---------------------------------------------------------------------------
+# IDA environment (guarded: the argument codec below stays importable and
+# testable outside IDA)
+# ---------------------------------------------------------------------------
+_IDA_OK = True
 try:
-    from unicall_ida import PLUGIN_ENTRY  # noqa: F401  re-exported for IDA
-except Exception as _ex:                  # surface import errors in Output
-    import traceback
-    print("[unicall_ida] import failed: %r" % (_ex,))
-    traceback.print_exc()
-    PLUGIN_ENTRY = None
+    import ida_bytes
+    import ida_idaapi
+    import ida_kernwin
+    import ida_nalt
+
+    try:
+        import ida_hexrays
+        HAS_HEXRAYS = ida_hexrays.init_hexrays_plugin()
+    except ImportError:                                # hexrays not present
+        HAS_HEXRAYS = False
+except ImportError:                                    # outside IDA
+    _IDA_OK = False
+    HAS_HEXRAYS = False
+
+if _IDA_OK:
+    from ida_hexrays import (
+        cot_add, cot_asg, cot_call, cot_cast, cot_idx, cot_num, cot_obj,
+        cot_ptr, cot_ref, cot_str, cot_var,
+    )
+    _BADADDR = ida_idaapi.BADADDR
+else:
+    _BADADDR = 0xFFFFFFFFFFFFFFFF
+
+ACTION_ID = "unicall:emulate_call"
+MENU_PATH = "unicall/"
+HOTKEY_EMULATE = "Ctrl-Alt-E"
+HOTKEY_MANUAL = "Ctrl-Alt-U"
+
+_current_vu = [None]
+
+
+# ===========================================================================
+# argument codec: dialog text <-> unicall call() values (pure logic)
+# ===========================================================================
+_HEX_BLOB_RE = re.compile(r"^[0-9a-fA-F]+$")
+_INT_RE = re.compile(r"^-?(0[xX][0-9a-fA-F]+|\d+)$")
+
+UNKNOWN_TEXTS = ("", "unknown", "?")
+
+
+class ArgumentError(ValueError):
+    """Raised when an argument field cannot be parsed."""
+
+
+def parse_arg_text(text):
+    """Parse one argument field. Returns int, bytes, or None (unknown)."""
+    t = (text or "").strip()
+    if t.lower() in UNKNOWN_TEXTS:
+        return None
+    if _INT_RE.match(t):
+        return int(t, 0)
+    if len(t) >= 2 and t[0] in "\"'" and t.endswith(t[0]):
+        body = t[1:-1].encode("utf-8").decode("unicode_escape")
+        return body.encode("utf-8") + b"\x00"
+    if _HEX_BLOB_RE.match(t) and len(t) % 2 == 0:
+        return bytes.fromhex(t)
+    raise ArgumentError(f"cannot parse argument field: {t!r} "
+                        f"(expected 0x.., integer, \"string\", or hex blob)")
+
+
+def encode_arg_text(value):
+    """Encode a value (int / bytes / str) into its dialog text form."""
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return hex(value)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, str):
+        return '"' + value + '"'
+    raise TypeError(f"cannot encode value of type {type(value)!r}")
+
+
+# ===========================================================================
+# ctree-based call argument extraction (IDA only)
+# ===========================================================================
+class ArgInfo:
+    """One extracted call argument."""
+
+    def __init__(self, kind, value, note=""):
+        self.kind = kind        # literal / address / string / stack-bytes / unknown
+        self.value = value      # int | bytes | None
+        self.note = note
+
+
+class CallInfo:
+    """The call expression selected in the pseudocode view."""
+
+    def __init__(self, ea, callee_ea, args):
+        self.ea = ea
+        self.callee_ea = callee_ea
+        self.args = args
+
+
+def _unwrap_cast(e):
+    while e.op == cot_cast:
+        e = e.x
+    return e
+
+
+def _string_at(ea):
+    try:
+        import ida_nalt
+        raw = ida_nalt.get_strlit_contents(ea, -1, ida_nalt.STRTYPE_C)
+        if raw:
+            return bytes(raw) + b"\x00"
+    except Exception:
+        pass
+    return None
+
+
+def _elem_size(lvar):
+    """Element size in bytes for an indexed local variable (default 8)."""
+    try:
+        ti = lvar.type()
+        if ti.is_array():
+            s = ti.get_array_element().get_size()
+            if s and 0 < s <= 64:
+                return s
+        s = ti.get_size()
+        if s and 0 < s <= 64:
+            return s
+    except Exception:
+        pass
+    return 8
+
+
+def _collect(cfunc):
+    """Walk the ctree once; return (all call exprs, all assignment pairs)."""
+    calls, assignments = [], []
+
+    class V(ida_hexrays.ctree_visitor_t):
+        def __init__(self):
+            super().__init__(ida_hexrays.CV_FAST)
+
+        def visit_expr(self, e):
+            try:
+                if e.op == cot_call:
+                    calls.append(e)
+                elif e.op == cot_asg:
+                    assignments.append((e.x, e.y))
+            except Exception:
+                pass
+            return 0
+
+    try:
+        V().apply_to(cfunc.body, None)
+    except Exception:
+        pass
+    return calls, assignments
+
+
+def find_call(vdui):
+    """Locate the call expression under the cursor (the call itself, the
+    callee name, or -- when unambiguous -- anywhere in the view)."""
+    item = vdui.ctree_item
+    if item is None or not item.is_citem():
+        return None
+    e = item.e
+    if e is None:
+        return None
+    e = _unwrap_cast(e)
+    if e.op == cot_call:
+        return e
+
+    calls, _ = _collect(vdui.cfunc)
+    if e.op == cot_obj:
+        direct = [c for c in calls
+                  if _unwrap_cast(c.x).op == cot_obj and c.x.obj_ea == e.obj_ea]
+        if len(direct) == 1:
+            return direct[0]
+        if len(direct) > 1:
+            if e.ea != _BADADDR:
+                for c in direct:
+                    if c.ea == e.ea:
+                        return c
+            return direct[0]
+    if len(calls) == 1:
+        return calls[0]
+    return None
+
+
+def _index_of_var(lhs, var_idx):
+    """Element index if lhs is var[idx] for var_idx, else None."""
+    lhs = _unwrap_cast(lhs)
+    if lhs.op == cot_idx and lhs.x.op == cot_var and lhs.x.v.idx == var_idx \
+            and lhs.y.op == cot_num:
+        try:
+            return int(lhs.y.numval())
+        except Exception:
+            return None
+    return None
+
+
+def _stack_var_bytes(cfunc, var_idx):
+    """Assemble a stack buffer built from immediate stores `var[i] = const`.
+
+    Elements are concatenated in ascending index order, little-endian.
+    Returns bytes only when the indices are contiguous from 0; gaps leave
+    the argument for manual entry."""
+    try:
+        lvar = cfunc.get_lvars()[var_idx]
+    except Exception:
+        return None
+    esize = _elem_size(lvar)
+
+    _, assignments = _collect(cfunc)
+    slots = {}
+    for lhs, rhs in assignments:
+        idx = _index_of_var(lhs, var_idx)
+        if idx is None:
+            continue
+        rhs = _unwrap_cast(rhs)
+        if rhs.op != cot_num:
+            continue
+        try:
+            val = int(rhs.numval()) & (2**64 - 1)
+        except Exception:
+            continue
+        slots[idx] = val.to_bytes(esize, "little")
+
+    if not slots:
+        return None
+    n = max(slots)
+    if min(slots) != 0 or len(slots) != n + 1 or (n + 1) * esize > 0x8000:
+        return None
+    return b"".join(slots[i] for i in range(n + 1))
+
+
+def _classify(cfunc, arg, lvars):
+    e = _unwrap_cast(arg)
+    op = e.op
+    if op == cot_num:
+        return ArgInfo("literal", int(e.numval()) & (2**64 - 1))
+    if op == cot_ref and e.x.op == cot_obj:
+        return ArgInfo("address", int(e.x.obj_ea))
+    if op == cot_obj:
+        s = _string_at(e.obj_ea)
+        if s:
+            return ArgInfo("string", s)
+        return ArgInfo("address", int(e.obj_ea))
+    if op == cot_str:
+        try:
+            s = str(e).strip('"')
+            return ArgInfo("string", s.encode("utf-8") + b"\x00")
+        except Exception:
+            pass
+    if op == cot_var and lvars is not None:
+        blob = _stack_var_bytes(cfunc, e.v.idx)
+        if blob is not None:
+            return ArgInfo("stack-bytes", blob,
+                           note=" (from immediate stores)")
+    return ArgInfo("unknown", None)
+
+
+def extract(vdui):
+    """Top-level helper: vdui -> CallInfo (or None when no call is found)."""
+    call = find_call(vdui)
+    if call is None:
+        return None
+    try:
+        callee = call.x.obj_ea if _unwrap_cast(call.x).op == cot_obj else None
+    except Exception:
+        callee = None
+    try:
+        lvars = vdui.cfunc.get_lvars()
+    except Exception:
+        lvars = None
+    args = []
+    for arg in call.a:
+        try:
+            args.append(_classify(vdui.cfunc, arg, lvars))
+        except Exception:
+            args.append(ArgInfo("unknown", None))
+    return CallInfo(call.ea, callee, args)
+
+
+# ===========================================================================
+# dialog + background worker (Qt bindings loaded lazily, IDA only)
+# ===========================================================================
+FORMAT_HELP = (
+    "Field format:  0x1A2B or -12 = integer/address   |   "
+    '"text" = C string   |   9c6e0c3a... = hex byte blob   |   '
+    "empty = unknown (fill in before running)")
+
+_QT_CACHE = {}
+
+
+def _qt():
+    if "qt" not in _QT_CACHE:
+        try:
+            from PySide6 import QtCore, QtWidgets
+        except ImportError:                            # IDA 7.x
+            from PyQt5 import QtCore, QtWidgets
+        _QT_CACHE["qt"] = (QtCore, QtWidgets)
+    return _QT_CACHE["qt"]
+
+
+_EMU_CACHE = {}
+
+
+def _get_emu(sample_path, base):
+    """Cached Emu per (sample path, base); the mapped image is reused."""
+    key = (sample_path, base)
+    if key not in _EMU_CACHE:
+        import unicall
+        kwargs = {"base": base} if base else {}
+        _EMU_CACHE[key] = unicall.Emu(sample_path, **kwargs)
+    return _EMU_CACHE[key]
+
+
+def _emulate_thread_class():
+    QtCore, _ = _qt()
+    if "EmulateThread" in _QT_CACHE:
+        return _QT_CACHE["EmulateThread"]
+
+    class EmulateThread(QtCore.QThread):
+        """Runs one unicall call() invocation off the UI thread."""
+
+        done = QtCore.Signal(object)      # str or int result
+        fail = QtCore.Signal(str)         # error text
+
+        def __init__(self, sample_path, base, call_ea, args, convention,
+                     ret_mode, parent=None):
+            super().__init__(parent)
+            self.sample_path = sample_path
+            self.base = base
+            self.call_ea = call_ea
+            self.args = args
+            self.convention = convention
+            self.ret_mode = ret_mode
+
+        def run(self):
+            try:
+                import unicall
+                emu = _get_emu(self.sample_path, self.base)
+                kwargs = {"ret": self.ret_mode}
+                if self.convention:
+                    kwargs["convention"] = self.convention
+                result = emu.call(self.call_ea, self.args, **kwargs)
+                self.done.emit(result)
+            except Exception as ex:
+                text = f"{type(ex).__name__}: {ex}\n\n{traceback.format_exc()}"
+                if isinstance(ex, ImportError):
+                    text += ("\n\nHint: the unicall package must be "
+                             "installed into the Python interpreter used "
+                             "by IDA, e.g.\n    <ida-python> -m pip install"
+                             " -e <path-to-unicall>")
+                self.fail.emit(text)
+
+    _QT_CACHE["EmulateThread"] = EmulateThread
+    return EmulateThread
+
+
+def _dialog_class():
+    QtCore, QtWidgets = _qt()
+    EmulateThread = _emulate_thread_class()
+    if "ParamDialog" in _QT_CACHE:
+        return _QT_CACHE["ParamDialog"]
+
+    class ParamDialog(QtWidgets.QDialog):
+        def __init__(self, sample_path, base, call_ea, arg_infos=None,
+                     parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("unicall - emulate call")
+            self.resize(760, 480)
+            self.sample_path = sample_path
+            self.base = base
+            self.call_ea = call_ea
+            self.vdui = None
+            self.thread = None
+            self.last_result = None
+
+            lay = QtWidgets.QVBoxLayout(self)
+
+            top = QtWidgets.QGridLayout()
+            top.addWidget(QtWidgets.QLabel("call address"), 0, 0)
+            self.ea_edit = QtWidgets.QLineEdit(
+                hex(call_ea) if call_ea else "")
+            top.addWidget(self.ea_edit, 0, 1)
+            top.addWidget(QtWidgets.QLabel("convention"), 0, 2)
+            self.conv_combo = QtWidgets.QComboBox()
+            self.conv_combo.addItems(["auto", "sysv", "win", "cdecl"])
+            top.addWidget(self.conv_combo, 0, 3)
+            top.addWidget(QtWidgets.QLabel("return as"), 0, 4)
+            self.ret_combo = QtWidgets.QComboBox()
+            self.ret_combo.addItems(["int", "str"])
+            top.addWidget(self.ret_combo, 0, 5)
+            lay.addLayout(top)
+
+            lay.addWidget(QtWidgets.QLabel("arguments"))
+            self.table = QtWidgets.QTableWidget(0, 3)
+            self.table.setHorizontalHeaderLabels(
+                ["#", "detected kind", "value"])
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.verticalHeader().setVisible(False)
+            lay.addWidget(self.table)
+
+            hint = QtWidgets.QLabel(FORMAT_HELP)
+            hint.setWordWrap(True)
+            lay.addWidget(hint)
+
+            btns = QtWidgets.QHBoxLayout()
+            self.run_btn = QtWidgets.QPushButton("Run")
+            self.run_btn.setDefault(True)
+            btns.addWidget(self.run_btn)
+            self.cmt_btn = QtWidgets.QPushButton(
+                "Write comment at call site")
+            btns.addWidget(self.cmt_btn)
+            btns.addStretch(1)
+            close_btn = QtWidgets.QPushButton("Close")
+            btns.addWidget(close_btn)
+            lay.addLayout(btns)
+
+            self.status = QtWidgets.QLabel("Ready.")
+            lay.addWidget(self.status)
+            self.output = QtWidgets.QPlainTextEdit()
+            self.output.setReadOnly(True)
+            lay.addWidget(self.output, 1)
+
+            self.run_btn.clicked.connect(self.on_run)
+            self.cmt_btn.clicked.connect(self.on_comment)
+            close_btn.clicked.connect(self.reject)
+
+            self.set_arg_infos(arg_infos or [])
+
+        def set_arg_infos(self, arg_infos):
+            self.table.setRowCount(len(arg_infos))
+            for row, info in enumerate(arg_infos):
+                idx_item = QtWidgets.QTableWidgetItem(str(row))
+                idx_item.setFlags(QtCore.Qt.ItemIsEnabled)
+                kind_item = QtWidgets.QTableWidgetItem(info.kind + info.note)
+                kind_item.setFlags(QtCore.Qt.ItemIsEnabled)
+                value = (encode_arg_text(info.value)
+                         if info.value is not None else "")
+                self.table.setItem(row, 0, idx_item)
+                self.table.setItem(row, 1, kind_item)
+                self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(value))
+            if arg_infos:
+                self.table.setColumnWidth(0, 36)
+                self.table.setColumnWidth(1, 220)
+
+        def on_run(self):
+            try:
+                ea_text = self.ea_edit.text().strip()
+                if not ea_text:
+                    raise ValueError("call address is empty")
+                call_ea = int(ea_text, 0)
+
+                values = []
+                for row in range(self.table.rowCount()):
+                    item = self.table.item(row, 2)
+                    text = item.text() if item else ""
+                    try:
+                        value = parse_arg_text(text)
+                    except ArgumentError as ex:
+                        raise ValueError(f"argument {row}: {ex}")
+                    if value is None:
+                        raise ValueError(
+                            f"argument {row} is empty; fill it in or "
+                            f"delete the row")
+                    values.append(value)
+
+                conv = self.conv_combo.currentText()
+                conv = None if conv == "auto" else conv
+                ret_mode = self.ret_combo.currentText()
+
+                self.run_btn.setEnabled(False)
+                self.status.setText("Emulating...")
+                self.thread = EmulateThread(
+                    self.sample_path, self.base, call_ea, values, conv,
+                    ret_mode, parent=self)
+                self.thread.done.connect(self.on_done)
+                self.thread.fail.connect(self.on_fail)
+                self.thread.start()
+            except Exception as ex:
+                self.status.setText(f"Error: {ex}")
+
+        def on_done(self, result):
+            self.run_btn.setEnabled(True)
+            self.status.setText("Done.")
+            if isinstance(result, bytes):
+                result = result.decode("utf-8", errors="replace")
+            if isinstance(result, str):
+                self.output.setPlainText(result)
+                self.last_result = result
+            else:
+                self.output.setPlainText(
+                    f"return value (RAX/EAX): {result:#x} ({result})")
+                self.last_result = f"{result:#x}"
+
+        def on_fail(self, text):
+            self.run_btn.setEnabled(True)
+            self.status.setText("Emulation failed - see output.")
+            self.output.setPlainText(text)
+
+        def on_comment(self):
+            text = self.last_result
+            if not text:
+                self.status.setText("Nothing to comment yet - run first.")
+                return
+            try:
+                ea_text = self.ea_edit.text().strip()
+                if not ea_text:
+                    raise ValueError("call address is empty")
+                ea = int(ea_text, 0)
+                comment = 'unicall: "%s"' % text.replace("\n", "\\n")[:400]
+                ida_bytes.set_cmt(ea, comment, 0)
+                if self.vdui is not None:
+                    self.vdui.refresh_view(True)
+                self.status.setText("Comment written.")
+            except Exception as ex:
+                self.status.setText(f"Comment failed: {ex}")
+
+    _QT_CACHE["ParamDialog"] = ParamDialog
+    return ParamDialog
+
+
+def show_dialog(sample_path, base, info=None, vdui=None, manual_ea=None):
+    """Open the dialog. `info` is CallInfo (approach A) or None (approach B:
+    manual mode with blank fields)."""
+    ParamDialog = _dialog_class()
+    if info is not None:
+        call_ea = info.ea if info.ea and info.ea != _BADADDR \
+            else (info.callee_ea or 0)
+        dialog = ParamDialog(sample_path, base, call_ea, info.args)
+        dialog.vdui = vdui
+    else:
+        blanks = [ArgInfo("unknown", None) for _ in range(6)]
+        dialog = ParamDialog(sample_path, base, manual_ea or 0, blanks)
+    dialog.show()
+    return dialog
+
+
+# ===========================================================================
+# IDA plugin integration
+# ===========================================================================
+def _context():
+    """(sample_path, image_base) of the current database."""
+    return ida_nalt.get_input_file_path(), ida_nalt.get_imagebase()
+
+
+def _open_from_vu(vu, manual=False):
+    sample, base = _context()
+    if not manual and vu is not None:
+        try:
+            info = extract(vu)
+        except Exception as ex:
+            info = None
+            ida_kernwin.warning(
+                f"unicall: argument extraction failed: {ex}\n"
+                f"Opening the dialog in manual mode.")
+        if info is not None:
+            show_dialog(sample, base, info=info, vdui=vu)
+            return
+    show_dialog(sample, base, info=None, vdui=vu,
+                manual_ea=ida_kernwin.get_screen_ea())
+
+
+if _IDA_OK:
+    class _EmulateActionHandler(ida_kernwin.action_handler_t):
+        def activate(self, ctx):
+            vu = _current_vu[0]
+            if vu is None and HAS_HEXRAYS:
+                widget = ida_kernwin.get_current_widget()
+                if widget is not None:
+                    vu = ida_hexrays.get_widget_vdui(widget)
+            _open_from_vu(vu, manual=(vu is None))
+            return 1
+
+        def update(self, ctx):
+            return ida_kernwin.AST_ENABLE_ALWAYS
+
+    def _hexrays_callback(event, *args):
+        if event == ida_hexrays.hxe_populating_popup:
+            form, popup, vu = args[0], args[1], args[2]
+            _current_vu[0] = vu
+            ida_kernwin.attach_action_to_popup(form, popup, ACTION_ID,
+                                               MENU_PATH)
+        return 0
+
+
+if _IDA_OK:
+    class unicall_plugin_t(ida_idaapi.plugin_t):
+        flags = ida_idaapi.PLUGIN_KEEP
+        comment = "unicall: emulate a single call with Unicorn (PE/ELF)"
+        help = ("Right-click a call in the pseudocode view, or Edit > "
+                "Plugins > unicall for manual mode.")
+        wanted_name = "unicall"
+        wanted_hotkey = HOTKEY_MANUAL
+
+        def init(self):
+            desc = ida_kernwin.action_desc_t(
+                ACTION_ID, "unicall: emulate this call",
+                _EmulateActionHandler(), HOTKEY_EMULATE,
+                "Emulate the call under the cursor with unicall", -1)
+            ida_kernwin.register_action(desc)
+            if HAS_HEXRAYS:
+                ida_hexrays.install_hexrays_callback(_hexrays_callback)
+                print("[unicall_ida] loaded (pseudocode integration "
+                      "active).")
+            else:
+                print("[unicall_ida] loaded (Hex-Rays unavailable; manual "
+                      "mode only via Edit > Plugins).")
+            return ida_idaapi.PLUGIN_KEEP
+
+        def run(self, arg):
+            _open_from_vu(None, manual=True)
+
+        def term(self):
+            ida_kernwin.unregister_action(ACTION_ID)
+
+    def PLUGIN_ENTRY():
+        return unicall_plugin_t()
+
+else:
+    unicall_plugin_t = None
+
+    def PLUGIN_ENTRY():                                # pragma: no cover
+        raise ImportError("unicall_ida must be loaded inside IDA")
